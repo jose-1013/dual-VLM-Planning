@@ -30,22 +30,19 @@ def extract_json(text):
         raise ValueError("JSON parsing failed")
 
 # =============================
-# Scene 이해
+# Scene 이해 (VLM)
 # =============================
 def perception(image):
 
-    prompt = f"""
-Instruction:
-{instruction}
-
+    prompt = """
 Describe the scene in structured JSON.
 
 Return:
-{{
+{
   "objects": [
-    {{"name": "", "location": "", "state": ""}}
+    {"name": "", "location": "", "state": ""}
   ]
-}}
+}
 """
 
     res = client.chat.completions.create(
@@ -62,116 +59,38 @@ Return:
     return extract_json(res.choices[0].message.content)
 
 # =============================
-# Planning (한 번 실행)
+# 후보 + confidence 생성
 # =============================
-def generate_plan(scene, query):
+def generate_candidates(scene, context):
 
     prompt = f"""
 Instruction:
-{query}
+{context["instruction"]}
+
+User preference so far:
+{context.get("preference", "")}
 
 Scene:
 {scene}
 
-Select the best action plan.
+You are making a decision under uncertainty.
+
+Your goal:
+- propose possible choices
+- estimate confidence
+- update your belief over time
+
+Important:
+- Confidence should reflect your current belief
+- If user preference exists, incorporate it
+- Over iterations, your confidence should become sharper if information increases
 
 Return JSON:
 {{
-  "plan": [],
-  "target_object": "",
-  "reason": ""
+  "candidates": [
+    {{"object": "", "confidence": 0.0}}
+  ]
 }}
-"""
-
-    res = client.chat.completions.create(
-        model="gpt-4o",
-        temperature=0.7,
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    return extract_json(res.choices[0].message.content)
-
-# =============================
-# Self-consistency
-# =============================
-def sample_plans(scene, query, n=5):
-
-    outputs = []
-
-    for _ in range(n):
-        try:
-            plan = generate_plan(scene, query)
-            outputs.append(json.dumps(plan))
-        except:
-            continue
-
-    return outputs
-
-# =============================
-# Uncertainty 계산
-# =============================
-def compute_uncertainty(samples):
-
-    if len(samples) <= 1:
-        return 1.0
-
-    unique = len(set(samples))
-    total = len(samples)
-
-    return unique / total  # 다양성
-
-# =============================
-# Uncertainty 원인 분석
-# =============================
-def analyze_uncertainty(scene, query, samples):
-
-    prompt = f"""
-Instruction:
-{query}
-
-Scene:
-{scene}
-
-Generated plans:
-{samples}
-
-Why is the model uncertain?
-
-Return JSON:
-{{
-  "type": "object / preference / spatial / planning",
-  "reason": ""
-}}
-"""
-
-    res = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    return extract_json(res.choices[0].message.content)
-
-# =============================
-# 질문 생성 (핵심)
-# =============================
-def generate_question(scene, query, reason):
-
-    prompt = f"""
-Instruction:
-{query}
-
-Scene:
-{scene}
-
-Uncertainty:
-{reason}
-
-Ask ONE question to reduce uncertainty.
-
-Rules:
-- specific
-- mention objects
-- not vague
 """
 
     res = client.chat.completions.create(
@@ -180,7 +99,92 @@ Rules:
         messages=[{"role": "user", "content": prompt}]
     )
 
+    return extract_json(res.choices[0].message.content)
+
+# =============================
+# Uncertainty (entropy)
+# =============================
+def compute_uncertainty(candidates):
+
+    probs = np.array([c["confidence"] for c in candidates])
+    probs = probs / probs.sum()
+
+    entropy = -np.sum(probs * np.log(probs + 1e-9))
+
+    return entropy
+
+# =============================
+# 질문 생성 (self-reflective)
+# =============================
+def generate_question(scene, context, candidates):
+
+    prompt = f"""
+Instruction:
+{context["instruction"]}
+
+User preference so far:
+{context.get("preference", "")}
+
+Scene:
+{scene}
+
+Candidates:
+{candidates}
+
+You are trying to reduce uncertainty.
+
+Think:
+- Why is the decision still ambiguous?
+- What missing information would change your confidence?
+
+Ask ONE question that would most reduce uncertainty.
+
+Do not ask generic questions.
+"""
+
+    res = client.chat.completions.create(
+        model="gpt-4o",
+        temperature=0.5,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
     return res.choices[0].message.content
+
+# =============================
+# Plan 생성
+# =============================
+def generate_plan(scene, context, target):
+
+    prompt = f"""
+Instruction:
+{context["instruction"]}
+
+User preference:
+{context.get("preference", "")}
+
+Scene:
+{scene}
+
+Selected object:
+{target}
+
+Generate a simple step-by-step plan.
+"""
+
+    res = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return res.choices[0].message.content
+
+# =============================
+# 출력
+# =============================
+def print_candidates(candidates):
+    print("\n[Candidates]")
+    for c in candidates:
+        print(f"- {c['object']}: {c['confidence']:.2f}")
 
 # =============================
 # MAIN LOOP
@@ -193,44 +197,50 @@ def run():
     print("\n[Scene]")
     print(scene)
 
-    query = instruction
+    context = {
+        "instruction": instruction,
+        "preference": ""
+    }
 
     MAX_TURN = 3
-    threshold = 0.4
+    entropy_threshold = 0.4
+    confidence_threshold = 0.8
 
     for t in range(MAX_TURN):
 
         print(f"\n--- Iteration {t+1} ---")
 
-        samples = sample_plans(scene, query)
-        U = compute_uncertainty(samples)
+        result = generate_candidates(scene, context)
+        candidates = result["candidates"]
 
-        print(f"[Uncertainty]: {U:.3f}")
+        print_candidates(candidates)
 
-        # 확신 높음 → 바로 실행
-        if U < threshold:
+        U = compute_uncertainty(candidates)
+        print(f"\n[Entropy]: {U:.3f}")
+
+        best = max(candidates, key=lambda x: x["confidence"])
+        print(f"[Best]: {best['object']} ({best['confidence']:.2f})")
+
+        # 종료 조건 (확신 기반)
+        if best["confidence"] > confidence_threshold:
             print("\n[CONFIDENT → PLAN]")
-            final = generate_plan(scene, query)
-            return final
+            return generate_plan(scene, context, best["object"])
 
         # 불확실 → 질문
         print("\n[UNCERTAIN → ASK]")
 
-        reason = analyze_uncertainty(scene, query, samples)
-        print("\n[Reason]")
-        print(reason)
-
-        question = generate_question(scene, query, reason)
+        question = generate_question(scene, context, candidates)
         print("\n[Question]")
         print(question)
 
         user_answer = input("\nUser: ")
 
-        query = query + " " + user_answer
+        # belief 업데이트 (누적)
+        context["preference"] += " " + user_answer
 
     # fallback
     print("\n[FALLBACK PLAN]")
-    return generate_plan(scene, query)
+    return generate_plan(scene, context, best["object"])
 
 # =============================
 # 실행

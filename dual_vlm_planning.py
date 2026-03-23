@@ -5,21 +5,19 @@ import os
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-instruction = "Two guests are arriving in 15 minutes, so please make sure to get everything ready in time."
+instruction = "create a space where I can rest comfortably."
 
 # =============================
-# 유틸 (안전 JSON)
+# JSON 파싱
 # =============================
 def extract_json(text):
-    if not text or text.strip() == "":
+    if not text:
         return {}
 
     text = text.strip()
 
     if text.startswith("```"):
-        parts = text.split("```")
-        if len(parts) > 1:
-            text = parts[1]
+        text = text.split("```")[1]
 
     text = text.replace("json", "").strip()
 
@@ -34,6 +32,9 @@ def extract_json(text):
     except:
         return {}
 
+# =============================
+# 이미지 encode
+# =============================
 def encode(path):
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode()
@@ -67,7 +68,7 @@ def print_final(plan):
         print(step)
 
 # =============================
-# Perception
+# perception
 # =============================
 def perception(agent_name, image):
     prompt = f"""
@@ -94,70 +95,96 @@ Return JSON:
     return extract_json(res.choices[0].message.content)
 
 # =============================
-# Object + Validation
+# 초기 plan 생성
 # =============================
-def get_available_objects(memory):
-    return list(set(
-        obj["name"] for agent in memory for obj in memory[agent]["objects"]
-    ))
+def initial_plan(agent_name, memory):
 
+    prompt = f"""
+Instruction:
+{instruction}
+
+You are {agent_name}.
+
+Your environment:
+{memory[agent_name]}
+
+Create an initial plan ONLY based on your observation.
+
+Return JSON:
+{{
+  "plan": [
+    {{"action": "", "target": "", "agent": "{agent_name}"}}
+  ]
+}}
+"""
+
+    res = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7
+    )
+
+    msg = extract_json(res.choices[0].message.content)
+    return msg.get("plan", [])
+
+# =============================
+# plan validation
+# =============================
 def normalize_step(step):
     if isinstance(step, dict):
         return step
-    if isinstance(step, str):
-        return {"task": step, "object": ""}
     return None
 
-def validate_plan(plan, available_objects):
+def validate_plan(plan):
     valid = []
-
     if not isinstance(plan, list):
         return valid
 
     for step in plan:
         step = normalize_step(step)
-        if not step:
-            continue
-
-        obj = str(step.get("object", "")).lower()
-
-        # object 없으면 통과
-        if obj == "":
-            valid.append(step)
-            continue
-
-        if any(o.lower() in obj for o in available_objects):
+        if step:
             valid.append(step)
 
     return valid
 
 # =============================
-# Agreement
+# 🔥 STRICT AGREEMENT
 # =============================
-def compute_agreement(plan_a, plan_b):
-    if not plan_a or not plan_b:
+def canonical_step(step):
+    return (
+        step.get("action", "").lower().strip(),
+        step.get("target", "").lower().strip(),
+        step.get("agent", "").lower().strip()
+    )
+
+def compute_agreement(a, b):
+    if not a or not b:
         return 0.0
 
-    set_a = set([str(p) for p in plan_a])
-    set_b = set([str(p) for p in plan_b])
+    a_steps = [canonical_step(x) for x in a]
+    b_steps = [canonical_step(x) for x in b]
 
-    intersection = len(set_a & set_b)
-    union = len(set_a | set_b)
+    # set 기반
+    set_match = len(set(a_steps) & set(b_steps))
+    set_score = set_match / max(len(a_steps), len(b_steps))
 
-    return intersection / union if union > 0 else 0.0
+    # 순서 기반
+    order_match = 0
+    for i in range(min(len(a_steps), len(b_steps))):
+        if a_steps[i] == b_steps[i]:
+            order_match += 1
+
+    order_score = order_match / max(len(a_steps), len(b_steps))
+
+    # 🔥 hybrid (엄격)
+    return 0.7 * order_score + 0.3 * set_score
 
 # =============================
-# Growth 제한
-# =============================
-def limit_growth(old_plan, new_plan, max_add=2):
-    if len(new_plan) > len(old_plan) + max_add:
-        return new_plan[:len(old_plan) + max_add]
-    return new_plan
-
-# =============================
-# Agent Step
+# agent step (critic)
 # =============================
 def agent_step(agent_name, memory, dialogue, current_plan):
+
+    other = "Agent1" if agent_name == "Agent2" else "Agent2"
 
     prompt = f"""
 Instruction:
@@ -172,21 +199,29 @@ Your environment:
 {memory[agent_name]}
 
 Other agent environment:
-{memory}
+{memory[other]}
 
 Dialogue:
 {dialogue}
 
-Modify the plan. Keep useful steps.
+GOAL:
+Improve the plan collaboratively.
 
-Return JSON ONLY:
+RULES:
+- Only modify if necessary
+- Add at most ONE new step
+- If plan is sufficient → return unchanged
+
+Return JSON:
 
 {{
   "role_assignment": {{
     "Agent1": "",
     "Agent2": ""
   }},
-  "plan_update": []
+  "plan_update": [
+    {{"action": "", "target": "", "agent": ""}}
+  ]
 }}
 """
 
@@ -200,6 +235,7 @@ Return JSON ONLY:
 
     if "plan_update" not in msg:
         msg["plan_update"] = []
+
     if "role_assignment" not in msg:
         msg["role_assignment"] = {"Agent1": "", "Agent2": ""}
 
@@ -210,7 +246,7 @@ Return JSON ONLY:
 # =============================
 print_instruction()
 
-img1 = encode("scene_1_1.png")
+img1 = encode("scene_5.png")
 img2 = encode("scene_4_2.png")
 
 memory = {
@@ -220,14 +256,15 @@ memory = {
 
 print_perception(memory)
 
-available_objects = get_available_objects(memory)
+# 초기 plan
+plan1 = initial_plan("Agent1", memory)
+plan2 = initial_plan("Agent2", memory)
 
+current_plan = plan1 + plan2
 dialogue = []
-current_plan = []
 
-THRESHOLD = 0.85
-MAX_TURN = 6
-
+THRESHOLD = 0.9
+MAX_TURN = 5
 turn = 1
 
 while turn <= MAX_TURN:
@@ -238,23 +275,20 @@ while turn <= MAX_TURN:
 
     prev_plan = current_plan.copy()
 
-    # -------- Agent1 --------
+    # Agent1
     msg1 = agent_step("Agent1", memory, dialogue, current_plan)
-    plan1 = validate_plan(msg1["plan_update"], available_objects)
+    plan1 = validate_plan(msg1["plan_update"])
 
     print_turn("Agent1", msg1)
     dialogue.append(f"Agent1: {msg1}")
 
-    # -------- Agent2 --------
+    # Agent2
     msg2 = agent_step("Agent2", memory, dialogue, plan1)
-    plan2 = validate_plan(msg2["plan_update"], available_objects)
-
-    plan2 = limit_growth(plan1, plan2)
+    plan2 = validate_plan(msg2["plan_update"])
 
     print_turn("Agent2", msg2)
     dialogue.append(f"Agent2: {msg2}")
 
-    # -------- agreement 계산 --------
     agreement1 = compute_agreement(prev_plan, plan1)
     agreement2 = compute_agreement(plan1, plan2)
 
@@ -266,15 +300,14 @@ while turn <= MAX_TURN:
 
     current_plan = plan2 if plan2 else plan1
 
+    # 🔥 agreement만으로 종료
     if final_agreement > THRESHOLD:
         print(">> Converged")
         break
 
     turn += 1
 
-# =============================
-# 출력
-# =============================
+# 결과
 if current_plan:
     print_final(current_plan)
 else:
